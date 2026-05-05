@@ -6,7 +6,7 @@ recommendations for cold start scenarios.
 """
 
 import logging
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta
 import numpy as np
 from bson import ObjectId
@@ -66,16 +66,17 @@ class DeepFMRecommenderService:
         """
         Get personalized homepage recommendations.
 
-        For logged-in users: DeepFM predictions
+        For logged-in users: DeepFM predictions (even for new users)
         For anonymous users: Popular tours
         """
         try:
             if user_id and self.is_initialized and self.deepfm.is_trained:
-                # Check if user exists in encoder (not cold start)
-                if user_id in self.deepfm.user_encoder:
-                    return await self._get_deepfm_recommendations(user_id, limit)
+                # Always use DeepFM for logged-in users
+                # New users will get recommendations based on tour features
+                # (destination, price, duration, etc.) instead of pure popularity
+                return await self._get_deepfm_recommendations(user_id, limit)
 
-            # Fallback to popular tours
+            # Fallback to popular tours for anonymous users only
             return await self._get_popular_tours(limit)
 
         except Exception as e:
@@ -95,8 +96,15 @@ class DeepFMRecommenderService:
         if not tour_ids:
             return []
 
+        # Check if user is cold-start (few or no interactions)
+        is_cold_start = await self._is_cold_start_user(user_id)
+
         # Get predictions from DeepFM
         predictions = await self.deepfm.predict(user_id, tour_ids, self.db)
+
+        # For cold-start users: add exploration diversity
+        if is_cold_start:
+            predictions = self._add_exploration_diversity(predictions, user_id)
 
         # Sort by score
         predictions.sort(key=lambda x: x[1], reverse=True)
@@ -122,6 +130,52 @@ class DeepFMRecommenderService:
                 break
 
         return result
+
+    async def _is_cold_start_user(self, user_id: str) -> bool:
+        """Check if user has few interactions (cold-start)."""
+        try:
+            interaction_service = getattr(self, '_interaction_service', None)
+            if not interaction_service and self.db:
+                # Count user interactions directly
+                count = await self.db.tbl_user_interactions.count_documents({
+                    'userId': user_id
+                })
+                return count < 5  # Cold-start if less than 5 interactions
+            return True  # Assume cold-start if can't check
+        except Exception:
+            return True
+
+    def _add_exploration_diversity(
+        self,
+        predictions: List[Tuple[str, float]],
+        user_id: str
+    ) -> List[Tuple[str, float]]:
+        """
+        Add exploration diversity for cold-start users.
+
+        Uses deterministic randomness based on user_id to ensure:
+        - Same user gets consistent recommendations across requests
+        - Different users get different recommendations
+        """
+        import hashlib
+
+        # Create deterministic seed from user_id
+        seed = int(hashlib.md5(user_id.encode()).hexdigest()[:8], 16)
+        np.random.seed(seed)
+
+        # Add small random noise to scores (exploration)
+        # Noise magnitude: 0.1-0.3 to shuffle rankings while keeping quality
+        diversified = []
+        for tour_id, score in predictions:
+            # Add deterministic noise based on user + tour
+            noise = np.random.uniform(-0.15, 0.15)
+            new_score = score + noise
+            diversified.append((tour_id, new_score))
+
+        # Reset random seed
+        np.random.seed(None)
+
+        return diversified
 
     async def _get_popular_tours(self, limit: int) -> List[Dict]:
         """Get popular tours based on bookings and ratings."""
@@ -337,20 +391,19 @@ class DeepFMRecommenderService:
                 if tour['_id'] not in [r['_id'] for r in results]:
                     results.append(tour)
 
-            # 3. If user is known, boost with DeepFM scores
+            # 3. Boost with DeepFM scores for all logged-in users (including new users)
             if user_id and self.is_initialized and self.deepfm.is_trained:
-                if user_id in self.deepfm.user_encoder:
-                    tour_ids = [r['_id'] for r in results]
-                    predictions = await self.deepfm.predict(user_id, tour_ids, self.db)
-                    pred_map = {p[0]: p[1] for p in predictions}
+                tour_ids = [r['_id'] for r in results]
+                predictions = await self.deepfm.predict(user_id, tour_ids, self.db)
+                pred_map = {p[0]: p[1] for p in predictions}
 
-                    for tour in results:
-                        deepfm_score = pred_map.get(tour['_id'], 0.5)
-                        current_score = tour.get('_score', 0.5)
-                        # Blend scores: 60% original + 40% DeepFM
-                        tour['_score'] = 0.6 * current_score + 0.4 * deepfm_score
+                for tour in results:
+                    deepfm_score = pred_map.get(tour['_id'], 0.5)
+                    current_score = tour.get('_score', 0.5)
+                    # Blend scores: 60% original + 40% DeepFM
+                    tour['_score'] = 0.6 * current_score + 0.4 * deepfm_score
 
-                    results.sort(key=lambda x: x.get('_score', 0), reverse=True)
+                results.sort(key=lambda x: x.get('_score', 0), reverse=True)
 
             return results[:limit]
 

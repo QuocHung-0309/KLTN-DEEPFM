@@ -593,9 +593,24 @@ class DeepFMRecommender:
         tour_ids: List[str],
         db
     ) -> List[Tuple[str, float]]:
-        """Predict scores for user-tour pairs."""
+        """
+        Predict scores for user-tour pairs.
+
+        For new users (not in encoder), they will use index 0 embedding.
+        This means recommendations will be based primarily on tour features
+        rather than user-specific preferences.
+        """
         if not self.is_trained or self.model is None:
             return [(tid, 0.5) for tid in tour_ids]
+
+        # Dynamically add new user to encoder if needed
+        # This ensures the user gets a unique embedding for future interactions
+        if user_id not in self.user_encoder:
+            new_idx = len(self.user_encoder) + 1
+            # Check if within model capacity
+            if new_idx < self.model.num_users:
+                self.user_encoder[user_id] = new_idx
+                logger.info(f"Added new user to encoder: {user_id} -> {new_idx}")
 
         # Get tour info
         from bson import ObjectId
