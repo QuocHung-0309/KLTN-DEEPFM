@@ -30,9 +30,14 @@ def format_tour_response(tour: dict) -> dict:
         "destinationSlug": tour.get("destinationSlug", ""),
         "priceAdult": tour.get("priceAdult", 0),
         "priceChild": tour.get("priceChild", 0),
+        "salePrice": tour.get("salePrice"),
+        "discountPercent": tour.get("discountPercent"),
         "time": tour.get("time", ""),
         "description": tour.get("description", ""),
         "images": tour.get("images", []),
+        "quantity": tour.get("quantity"),
+        "startDate": tour.get("startDate"),
+        "upcomingDepartures": tour.get("upcomingDepartures", []),
     }
 
 
