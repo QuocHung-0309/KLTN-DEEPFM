@@ -1,0 +1,12 @@
+{
+    "sparse_col":{
+        "destination":0,
+        "price_bucket":1,
+        "duration_bucket":2
+    },
+    "item_sparse_col":{
+        "destination":0,
+        "price_bucket":1,
+        "duration_bucket":2
+    }
+}

@@ -8,7 +8,6 @@ recommendations for cold start scenarios.
 import logging
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta
-import numpy as np
 from bson import ObjectId
 
 from .deepfm_model import DeepFMRecommender
@@ -19,25 +18,31 @@ logger = logging.getLogger(__name__)
 
 class DeepFMRecommenderService:
     """
-    DeepFM-based Tour Recommendation Service.
+    Hybrid-primary + DeepFM re-rank Recommendation Service.
 
-    Features:
-    - DeepFM for personalized recommendations
-    - Popularity fallback for cold start
-    - Content-based similar tours
-    - Online learning from user interactions
-    - Diversity boost (max N tours per destination)
+    Pipeline:
+    1. HybridRecommender (CF + Content-based + Popularity) tạo candidate pool
+    2. DeepFM re-score candidates để tinh chỉnh thứ hạng
+    3. Blend score: 70% Hybrid + 30% DeepFM
+    4. Diversity filter (max N tours per destination)
+
+    Lý do dùng Hybrid làm primary:
+    - Dataset nhỏ (71 users, 43 tours) → DeepFM dễ overfit
+    - Hybrid đã xử lý tốt cold-start qua popularity + content-based
+    - DeepFM bổ sung tín hiệu cá nhân hóa khi có đủ dữ liệu
     """
 
     def __init__(
         self,
         tour_service: TourService,
-        model_path: str = "models/deepfm",
+        model_path: str = "models/deepfm_libreco",
         max_per_destination: int = 2,
+        hybrid_recommender=None,
     ):
         self.tour_service = tour_service
         self.model_path = model_path
         self.max_per_destination = max_per_destination
+        self.hybrid_recommender = hybrid_recommender
 
         self.deepfm = DeepFMRecommender(model_path=model_path)
         self.db = None
@@ -66,19 +71,13 @@ class DeepFMRecommenderService:
         """
         Get personalized homepage recommendations.
 
-        For logged-in users: DeepFM predictions (even for new users)
+        For logged-in users: Hybrid candidates + DeepFM re-rank
         For anonymous users: Popular tours
         """
         try:
-            if user_id and self.is_initialized and self.deepfm.is_trained:
-                # Always use DeepFM for logged-in users
-                # New users will get recommendations based on tour features
-                # (destination, price, duration, etc.) instead of pure popularity
+            if user_id and self.is_initialized:
                 return await self._get_deepfm_recommendations(user_id, limit)
-
-            # Fallback to popular tours for anonymous users only
             return await self._get_popular_tours(limit)
-
         except Exception as e:
             logger.error(f"Homepage recommendation error: {e}")
             return await self._get_popular_tours(limit)
@@ -88,94 +87,65 @@ class DeepFMRecommenderService:
         user_id: str,
         limit: int
     ) -> List[Dict]:
-        """Get DeepFM-based recommendations for a user."""
-        # Get all available tours
-        all_tours = await self.tour_service.get_all_tours()
-        tour_ids = [str(t['_id']) for t in all_tours]
+        """
+        Hybrid-primary + DeepFM re-rank pipeline.
 
-        if not tour_ids:
+        Bước 1: Hybrid tạo candidate pool (4× limit)
+        Bước 2: DeepFM re-score → blend 70% Hybrid + 30% DeepFM
+        Bước 3: Diversity filter → top-N
+        """
+        candidate_limit = limit * 4
+
+        # ── Bước 1: Candidates từ Hybrid ─────────────────────────────────────
+        candidates: List[Dict] = []
+        if self.hybrid_recommender:
+            try:
+                candidates = await self.hybrid_recommender.get_homepage_recommendations(
+                    user_id, candidate_limit
+                )
+            except Exception as e:
+                logger.warning(f"Hybrid candidate generation failed: {e}")
+
+        # Fallback nếu Hybrid không có kết quả
+        if not candidates:
+            all_tours = await self.tour_service.get_all_tours()
+            candidates = [self._format_tour(t, 0.5) for t in all_tours]
+
+        if not candidates:
             return []
 
-        # Check if user is cold-start (few or no interactions)
-        is_cold_start = await self._is_cold_start_user(user_id)
+        # ── Bước 2: DeepFM re-score ──────────────────────────────────────────
+        if self.deepfm.is_trained and self.deepfm.model is not None:
+            tour_ids = [c['_id'] for c in candidates]
+            deepfm_scores = await self.deepfm.predict(user_id, tour_ids, self.db)
+            deepfm_map = {tid: s for tid, s in deepfm_scores}
 
-        # Get predictions from DeepFM
-        predictions = await self.deepfm.predict(user_id, tour_ids, self.db)
+            # Normalize DeepFM scores về [0, 1]
+            raw_scores = [deepfm_map.get(c['_id'], 0.5) for c in candidates]
+            min_s, max_s = min(raw_scores), max(raw_scores)
+            denom = (max_s - min_s) if max_s > min_s else 1.0
 
-        # For cold-start users: add exploration diversity
-        if is_cold_start:
-            predictions = self._add_exploration_diversity(predictions, user_id)
+            for c in candidates:
+                norm_deepfm = (deepfm_map.get(c['_id'], 0.5) - min_s) / denom
+                hybrid_score = c.get('_score', 0.5)
+                # Blend: Hybrid là primary (70%), DeepFM là tín hiệu bổ sung (30%)
+                c['_score'] = 0.7 * hybrid_score + 0.3 * norm_deepfm
 
-        # Sort by score
-        predictions.sort(key=lambda x: x[1], reverse=True)
+        # ── Bước 3: Sort + Diversity filter ──────────────────────────────────
+        candidates.sort(key=lambda x: x.get('_score', 0), reverse=True)
 
-        # Apply diversity: max N tours per destination
         result = []
-        dest_count = {}
-        tour_map = {str(t['_id']): t for t in all_tours}
-
-        for tour_id, score in predictions:
-            tour = tour_map.get(tour_id)
-            if not tour:
-                continue
-
+        dest_count: Dict[str, int] = {}
+        for tour in candidates:
             dest = tour.get('destination', 'Unknown')
             if dest_count.get(dest, 0) >= self.max_per_destination:
                 continue
-
             dest_count[dest] = dest_count.get(dest, 0) + 1
-            result.append(self._format_tour(tour, score))
-
+            result.append(tour)
             if len(result) >= limit:
                 break
 
         return result
-
-    async def _is_cold_start_user(self, user_id: str) -> bool:
-        """Check if user has few interactions (cold-start)."""
-        try:
-            interaction_service = getattr(self, '_interaction_service', None)
-            if not interaction_service and self.db:
-                # Count user interactions directly
-                count = await self.db.tbl_user_interactions.count_documents({
-                    'userId': user_id
-                })
-                return count < 5  # Cold-start if less than 5 interactions
-            return True  # Assume cold-start if can't check
-        except Exception:
-            return True
-
-    def _add_exploration_diversity(
-        self,
-        predictions: List[Tuple[str, float]],
-        user_id: str
-    ) -> List[Tuple[str, float]]:
-        """
-        Add exploration diversity for cold-start users.
-
-        Uses deterministic randomness based on user_id to ensure:
-        - Same user gets consistent recommendations across requests
-        - Different users get different recommendations
-        """
-        import hashlib
-
-        # Create deterministic seed from user_id
-        seed = int(hashlib.md5(user_id.encode()).hexdigest()[:8], 16)
-        np.random.seed(seed)
-
-        # Add small random noise to scores (exploration)
-        # Noise magnitude: 0.1-0.3 to shuffle rankings while keeping quality
-        diversified = []
-        for tour_id, score in predictions:
-            # Add deterministic noise based on user + tour
-            noise = np.random.uniform(-0.15, 0.15)
-            new_score = score + noise
-            diversified.append((tour_id, new_score))
-
-        # Reset random seed
-        np.random.seed(None)
-
-        return diversified
 
     async def _get_popular_tours(self, limit: int) -> List[Dict]:
         """Get popular tours based on bookings and ratings."""

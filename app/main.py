@@ -70,13 +70,14 @@ async def lifespan(app: FastAPI):
         hybrid_recommender = HybridRecommender(cf, cb, tour_service)
         await hybrid_recommender.initialize()
 
-        # Initialize DeepFM recommender
+        # Initialize DeepFM recommender (Hybrid primary + DeepFM re-rank)
         logger.info("Initializing DeepFM recommender...")
         try:
             from app.services.deepfm_recommender import DeepFMRecommenderService
             deepfm_recommender = DeepFMRecommenderService(
                 tour_service=tour_service,
-                model_path="models/deepfm"
+                model_path="models/deepfm_libreco",
+                hybrid_recommender=hybrid_recommender,
             )
             await deepfm_recommender.initialize(db)
             app.state.deepfm_recommender = deepfm_recommender

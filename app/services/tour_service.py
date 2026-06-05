@@ -93,8 +93,8 @@ class TourService:
         bookings_collection = get_collection("tbl_booking")
         departures_collection = get_collection("tbl_tour_departures")
 
-        # Get all confirmed bookings
-        cursor = bookings_collection.find({"bookingStatus": "c"})
+        # Get all confirmed/completed bookings
+        cursor = bookings_collection.find({"bookingStatus": {"$in": ["completed", "confirmed"]}})
         bookings = await cursor.to_list(length=10000)
 
         # Resolve tourId from tourDepartureId
@@ -135,7 +135,7 @@ class TourService:
         try:
             cursor = bookings_collection.find({
                 "userId": ObjectId(user_id),
-                "bookingStatus": "c"
+                "bookingStatus": {"$in": ["completed", "confirmed"]}
             })
             bookings = await cursor.to_list(length=100)
 
@@ -190,7 +190,7 @@ class TourService:
             # Count confirmed bookings for these departures
             count = await bookings_collection.count_documents({
                 "tourDepartureId": {"$in": departure_ids},
-                "bookingStatus": "c"
+                "bookingStatus": {"$in": ["completed", "confirmed"]}
             })
 
             return count
@@ -235,7 +235,7 @@ class TourService:
             # Find all users who booked these departures
             cursor = bookings_collection.find({
                 "tourDepartureId": {"$in": departure_ids},
-                "bookingStatus": "c"
+                "bookingStatus": {"$in": ["completed", "confirmed"]}
             })
             bookings = await cursor.to_list(length=1000)
 

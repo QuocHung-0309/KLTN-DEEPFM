@@ -1,0 +1,24 @@
+{
+    "task":"ranking",
+    "loss_type":"cross_entropy",
+    "embed_size":16,
+    "n_epochs":20,
+    "lr":0.001,
+    "lr_decay":false,
+    "epsilon":1e-05,
+    "reg":null,
+    "batch_size":256,
+    "sampler":"random",
+    "num_neg":1,
+    "use_bn":true,
+    "dropout_rate":0.2,
+    "hidden_units":[
+        128,
+        64,
+        32
+    ],
+    "multi_sparse_combiner":"sqrtn",
+    "seed":42,
+    "lower_upper_bound":null,
+    "tf_sess_config":null
+}

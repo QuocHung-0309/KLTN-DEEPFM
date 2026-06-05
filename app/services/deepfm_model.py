@@ -1,790 +1,490 @@
 """
-DeepFM Model Implementation using TensorFlow/Keras
+DeepFM Model using LibRecommender library.
 
-DeepFM = Linear + FM + DNN
+Thay thế custom TF/Keras implementation bằng LibRecommender để:
+- Dùng FM + Deep đã được tối ưu sẵn
+- Tự động negative sampling
+- Đánh giá metrics chuẩn (roc_auc, ndcg, precision, recall)
 
-Architecture:
-- Linear Part: First-order feature importance (w₀ + Σ wᵢxᵢ)
-- FM Part: Second-order feature interactions (Σᵢ Σⱼ <vᵢ, vⱼ> xᵢxⱼ)
-- DNN Part: High-order feature interactions
+Features:
+- destination (sparse, item)
+- price_bucket (sparse, item) — 10 buckets theo quantile
+- duration_bucket (sparse, item) — 0..6 (số ngày tour)
 
-Fields (8 total):
-- user_id (sparse)
-- tour_id (sparse)
-- destination_id (sparse)
-- price_bucket (sparse) - giá tour chia bucket
-- duration_bucket (sparse) - số ngày chia bucket
-- has_images (sparse) - 0/1
-- has_itinerary (sparse) - 0/1
-- season (sparse) - mùa du lịch
+Label sources (max label per user-tour pair):
+- tbl_reviews      → rating 1-5
+- tbl_booking      → completed=5, confirmed=4, pending=3
+- tbl_user_interactions → bookmark=4, share=3.5, click=2, view=1
 """
 
-import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model, regularizers
-from typing import Dict, List, Tuple, Optional
+import io
 import logging
 import os
 import pickle
+import re
+import sys
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from bson import ObjectId
 
 logger = logging.getLogger(__name__)
 
-# Constants
 NUM_PRICE_BUCKETS = 10
 NUM_DURATION_BUCKETS = 7
-NUM_SEASONS = 4
+
+BOOKING_LABELS  = {"completed": 5.0, "confirmed": 4.0, "pending": 3.0}
+INTERACT_LABELS = {"bookmark": 4.0, "share": 3.5, "click": 2.0, "view": 1.0}
 
 
-class LinearLayer(layers.Layer):
-    """Linear part: w₀ + Σ wᵢxᵢ for first-order feature importance."""
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-    def __init__(self, num_features: int, l2_reg: float = 1e-5, **kwargs):
-        super(LinearLayer, self).__init__(**kwargs)
-        self.num_features = num_features
-        self.l2_reg = l2_reg
-
-    def build(self, input_shape):
-        self.bias = self.add_weight(
-            name='linear_bias',
-            shape=(1,),
-            initializer='zeros',
-            trainable=True
-        )
-        self.built = True
-
-    def call(self, field_embeddings_list):
-        """
-        inputs: list of (batch, 1) tensors - one weight per field
-        """
-        # Sum all linear terms + bias
-        linear_out = self.bias
-        for emb in field_embeddings_list:
-            # Each embedding is (batch, emb_dim), take first dim as linear weight
-            linear_out = linear_out + tf.reduce_sum(emb[:, :1], axis=1, keepdims=True)
-        return linear_out
+def _parse_days(time_str: str) -> int:
+    if not time_str:
+        return 1
+    s = time_str.lower()
+    m = re.search(r"(\d+)\s*ng[aà]y", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*n", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)", time_str)
+    if m:
+        return int(m.group(1))
+    return 1
 
 
-class FMLayer(layers.Layer):
-    """
-    Factorization Machine Layer for second-order feature interactions.
-
-    FM: 0.5 * Σₖ[(Σᵢ vᵢₖxᵢ)² - Σᵢ vᵢₖ²xᵢ²]
-
-    This captures all pairwise interactions between fields:
-    - user × destination
-    - user × price_bucket
-    - destination × duration
-    - price × duration
-    - etc.
-    """
-
-    def __init__(self, **kwargs):
-        super(FMLayer, self).__init__(**kwargs)
-
-    def call(self, field_embeddings):
-        """
-        inputs shape: (batch_size, num_fields, embedding_dim)
-        Each field has its own embedding vector.
-        """
-        # Sum of embeddings: (batch, emb_dim)
-        sum_of_emb = tf.reduce_sum(field_embeddings, axis=1)
-        # Square of sum: (batch, emb_dim)
-        square_of_sum = tf.square(sum_of_emb)
-
-        # Sum of squares: (batch, emb_dim)
-        square_of_emb = tf.square(field_embeddings)
-        sum_of_square = tf.reduce_sum(square_of_emb, axis=1)
-
-        # FM output: (batch, 1)
-        fm_output = 0.5 * tf.reduce_sum(square_of_sum - sum_of_square, axis=1, keepdims=True)
-        return fm_output
+def _day_bucket(days: int) -> int:
+    return min(max(days - 1, 0), 6)
 
 
-class DNNLayer(layers.Layer):
-    """Deep Neural Network for high-order feature interactions."""
-
-    def __init__(
-        self,
-        hidden_units: List[int] = [256, 128, 64],
-        activation: str = 'relu',
-        dropout_rate: float = 0.2,
-        l2_reg: float = 1e-5,
-        **kwargs
-    ):
-        super(DNNLayer, self).__init__(**kwargs)
-        self.hidden_units = hidden_units
-        self.dropout_rate = dropout_rate
-
-        self.dense_layers = []
-        self.bn_layers = []
-        self.dropout_layers = []
-
-        for units in hidden_units:
-            self.dense_layers.append(
-                layers.Dense(
-                    units,
-                    activation=activation,
-                    kernel_regularizer=regularizers.l2(l2_reg)
-                )
-            )
-            self.bn_layers.append(layers.BatchNormalization())
-            self.dropout_layers.append(layers.Dropout(dropout_rate))
-
-    def call(self, inputs, training=False):
-        x = inputs
-        for dense, bn, dropout in zip(self.dense_layers, self.bn_layers, self.dropout_layers):
-            x = dense(x)
-            x = bn(x, training=training)
-            x = dropout(x, training=training)
-        return x
-
-
-class DeepFMModel(Model):
-    """
-    DeepFM Model for Tour Recommendation.
-
-    y = σ(y_linear + y_FM + y_DNN)
-
-    Fields (8 sparse features):
-    1. user_id - người dùng
-    2. tour_id - tour
-    3. destination_id - điểm đến
-    4. price_bucket - bucket giá (0-9)
-    5. duration_bucket - bucket số ngày (0-6)
-    6. has_images - có ảnh không (0/1)
-    7. has_itinerary - có lịch trình không (0/1)
-    8. season - mùa (0-3: xuân/hạ/thu/đông)
-    """
-
-    def __init__(
-        self,
-        num_users: int,
-        num_tours: int,
-        num_destinations: int,
-        embedding_dim: int = 16,
-        dnn_hidden_units: List[int] = [256, 128, 64],
-        dropout_rate: float = 0.3,
-        l2_reg: float = 1e-4,
-        **kwargs
-    ):
-        super(DeepFMModel, self).__init__(**kwargs)
-
-        self.num_users = num_users
-        self.num_tours = num_tours
-        self.num_destinations = num_destinations
-        self.embedding_dim = embedding_dim
-        self.num_fields = 8  # Total number of fields
-
-        # Embedding layers for each field
-        # Field 1: user_id
-        self.user_embedding = layers.Embedding(
-            num_users + 1, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='user_embedding'
-        )
-
-        # Field 2: tour_id
-        self.tour_embedding = layers.Embedding(
-            num_tours + 1, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='tour_embedding'
-        )
-
-        # Field 3: destination_id
-        self.dest_embedding = layers.Embedding(
-            num_destinations + 1, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='destination_embedding'
-        )
-
-        # Field 4: price_bucket (10 buckets)
-        self.price_embedding = layers.Embedding(
-            NUM_PRICE_BUCKETS + 1, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='price_embedding'
-        )
-
-        # Field 5: duration_bucket (7 buckets: 1-7+ days)
-        self.duration_embedding = layers.Embedding(
-            NUM_DURATION_BUCKETS + 1, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='duration_embedding'
-        )
-
-        # Field 6: has_images (0/1)
-        self.images_embedding = layers.Embedding(
-            2, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='images_embedding'
-        )
-
-        # Field 7: has_itinerary (0/1)
-        self.itinerary_embedding = layers.Embedding(
-            2, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='itinerary_embedding'
-        )
-
-        # Field 8: season (0-3)
-        self.season_embedding = layers.Embedding(
-            NUM_SEASONS + 1, embedding_dim,
-            embeddings_regularizer=regularizers.l2(l2_reg),
-            name='season_embedding'
-        )
-
-        # Linear Layer (first-order)
-        self.linear_layer = LinearLayer(self.num_fields, l2_reg=l2_reg, name='linear')
-
-        # FM Layer (second-order)
-        self.fm_layer = FMLayer(name='fm_layer')
-
-        # DNN Layer (high-order)
-        self.dnn_layer = DNNLayer(
-            hidden_units=dnn_hidden_units,
-            dropout_rate=dropout_rate,
-            l2_reg=l2_reg,
-            name='dnn_layer'
-        )
-
-        # Output layers
-        self.dnn_output = layers.Dense(1, name='dnn_output')
-        self.final_output = layers.Dense(1, activation='sigmoid', name='output')
-
-        # Flatten layer
-        self.flatten = layers.Flatten()
-
-    def call(self, inputs, training=False):
-        """
-        Forward pass.
-
-        inputs: Dict with keys:
-            - user_id: (batch_size,)
-            - tour_id: (batch_size,)
-            - destination_id: (batch_size,)
-            - price_bucket: (batch_size,)
-            - duration_bucket: (batch_size,)
-            - has_images: (batch_size,)
-            - has_itinerary: (batch_size,)
-            - season: (batch_size,)
-        """
-        # Get embeddings for all 8 fields
-        user_emb = self.user_embedding(inputs['user_id'])           # (batch, emb_dim)
-        tour_emb = self.tour_embedding(inputs['tour_id'])           # (batch, emb_dim)
-        dest_emb = self.dest_embedding(inputs['destination_id'])    # (batch, emb_dim)
-        price_emb = self.price_embedding(inputs['price_bucket'])    # (batch, emb_dim)
-        dur_emb = self.duration_embedding(inputs['duration_bucket'])# (batch, emb_dim)
-        img_emb = self.images_embedding(inputs['has_images'])       # (batch, emb_dim)
-        itin_emb = self.itinerary_embedding(inputs['has_itinerary'])# (batch, emb_dim)
-        season_emb = self.season_embedding(inputs['season'])        # (batch, emb_dim)
-
-        # List of all field embeddings for linear layer
-        field_emb_list = [user_emb, tour_emb, dest_emb, price_emb,
-                          dur_emb, img_emb, itin_emb, season_emb]
-
-        # Stack embeddings for FM: (batch, 8, emb_dim)
-        stacked_emb = tf.stack(field_emb_list, axis=1)
-
-        # === Linear Part (first-order) ===
-        linear_output = self.linear_layer(field_emb_list)  # (batch, 1)
-
-        # === FM Part (second-order) ===
-        fm_output = self.fm_layer(stacked_emb)  # (batch, 1)
-
-        # === DNN Part (high-order) ===
-        dnn_input = self.flatten(stacked_emb)  # (batch, 8 * emb_dim)
-        dnn_hidden = self.dnn_layer(dnn_input, training=training)  # (batch, 64)
-        dnn_output = self.dnn_output(dnn_hidden)  # (batch, 1)
-
-        # === Combine: Linear + FM + DNN ===
-        combined = linear_output + fm_output + dnn_output
-        output = self.final_output(combined)
-
-        return output
-
-    def get_config(self):
-        return {
-            'num_users': self.num_users,
-            'num_tours': self.num_tours,
-            'num_destinations': self.num_destinations,
-            'embedding_dim': self.embedding_dim,
-        }
-
+# ── Main class ────────────────────────────────────────────────────────────────
 
 class DeepFMRecommender:
     """
-    DeepFM-based Tour Recommender with Online Learning support.
+    DeepFM recommender built on LibRecommender.
+
+    Public interface giữ nguyên so với custom model cũ để
+    DeepFMRecommenderService không cần sửa.
     """
 
     def __init__(
         self,
-        model_path: str = "models/deepfm",
-        embedding_dim: int = 16,
-        learning_rate: float = 0.001,
-        batch_size: int = 64,
+        model_path: str = "models/deepfm_libreco",
+        n_epochs: int = 20,
+        embed_size: int = 16,
+        batch_size: int = 256,
+        lr: float = 1e-3,
     ):
         self.model_path = model_path
-        self.embedding_dim = embedding_dim
-        self.learning_rate = learning_rate
+        self.n_epochs = n_epochs
+        self.embed_size = embed_size
         self.batch_size = batch_size
+        self.lr = lr
 
-        self.model: Optional[DeepFMModel] = None
+        self.model = None
+        self.data_info = None
+
+        # Encoder mappings (MongoDB string ID → libreco int)
         self.user_encoder: Dict[str, int] = {}
         self.tour_encoder: Dict[str, int] = {}
-        self.dest_encoder: Dict[str, int] = {}
+        self.tour_decoder: Dict[int, str] = {}
+        self.dest_encoder: Dict[str, int] = {}   # kept for API compat
+        self.price_boundaries: List[float] = []
 
         self.is_trained = False
-        self.last_update = None
+        self.last_update: Optional[datetime] = None
+        self.training_history: List[Dict] = []
 
-        # Feature statistics for bucketing
-        self.price_boundaries = []  # Will be computed from data
+        # Buffer cho online-style updates (retrain khi đủ ngưỡng)
+        self._pending: List[Dict] = []
+        self._retrain_threshold = 100
+
+    # ── Initialize / Load ────────────────────────────────────────────────────
 
     async def initialize(self, db) -> None:
-        """Initialize model with data from database."""
-        logger.info("Initializing DeepFM Recommender...")
-
-        # Load existing model or create new
         if self._load_model():
-            logger.info("Loaded existing DeepFM model")
+            logger.info("LibRecommender DeepFM loaded from disk")
+            self.is_trained = True
         else:
-            await self._build_encoders(db)
-            await self._compute_price_boundaries(db)
-            self._create_model()
-            logger.info("Created new DeepFM model")
-
-        # Initial training if not trained
-        if not self.is_trained:
+            logger.info("No saved model — training from scratch")
             await self.train(db)
 
-    async def _build_encoders(self, db) -> None:
-        """Build ID encoders for sparse features."""
-        # Users
-        users = await db.tbl_users.find({}, {'_id': 1}).to_list(10000)
-        self.user_encoder = {str(u['_id']): i + 1 for i, u in enumerate(users)}
+    # ── Data preparation ──────────────────────────────────────────────────────
 
-        # Tours
-        tours = await db.tbl_tours.find({}, {'_id': 1, 'destination': 1}).to_list(1000)
-        self.tour_encoder = {str(t['_id']): i + 1 for i, t in enumerate(tours)}
+    async def _fetch_and_build_df(self, db) -> pd.DataFrame:
+        """Load data từ MongoDB và trả về DataFrame theo format LibRecommender."""
 
-        # Destinations
-        destinations = set(t.get('destination', 'Unknown') for t in tours)
-        self.dest_encoder = {d: i + 1 for i, d in enumerate(destinations)}
+        tours_raw = await db.tbl_tours.find(
+            {}, {"_id": 1, "destination": 1, "priceAdult": 1, "time": 1}
+        ).to_list(1000)
 
-        logger.info(f"Encoders built: {len(self.user_encoder)} users, "
-                   f"{len(self.tour_encoder)} tours, {len(self.dest_encoder)} destinations")
+        deps_raw = await db.tbl_tour_departures.find(
+            {}, {"_id": 1, "tourId": 1}
+        ).to_list(5000)
 
-    async def _compute_price_boundaries(self, db) -> None:
-        """Compute price bucket boundaries using quantiles."""
-        tours = await db.tbl_tours.find({}).to_list(1000)
-        prices = [t.get('priceAdult', 0) for t in tours if t.get('priceAdult', 0) > 0]
+        reviews_raw = await db.tbl_reviews.find(
+            {}, {"_id": 1, "userId": 1, "tourId": 1, "rating": 1}
+        ).to_list(10000)
 
-        if prices:
-            # Create 10 buckets using percentiles
-            self.price_boundaries = [
-                np.percentile(prices, p) for p in range(10, 100, 10)
-            ]
-        else:
-            # Default boundaries (in VND)
-            self.price_boundaries = [
-                1000000, 2000000, 3000000, 4000000, 5000000,
-                6000000, 8000000, 10000000, 15000000
-            ]
+        bookings_raw = await db.tbl_booking.find(
+            {"bookingStatus": {"$in": ["completed", "confirmed", "pending"]}},
+            {"_id": 1, "userId": 1, "tourDepartureId": 1, "bookingStatus": 1}
+        ).to_list(10000)
 
-        logger.info(f"Price boundaries: {self.price_boundaries}")
+        interactions_raw = await db.tbl_user_interactions.find(
+            {"type": {"$in": ["view", "click", "bookmark", "share"]}},
+            {"_id": 1, "userId": 1, "tourId": 1, "type": 1}
+        ).to_list(50000)
 
-    def _get_price_bucket(self, price: float) -> int:
-        """Convert price to bucket index (0-9)."""
-        for i, boundary in enumerate(self.price_boundaries):
-            if price <= boundary:
+        if not tours_raw:
+            return pd.DataFrame()
+
+        dep_to_tour = {str(d["_id"]): str(d["tourId"]) for d in deps_raw}
+        tour_info   = {str(t["_id"]): t for t in tours_raw}
+
+        # Price boundaries
+        prices = [t.get("priceAdult", 0) for t in tours_raw if t.get("priceAdult", 0) > 0]
+        self.price_boundaries = (
+            [np.percentile(prices, p) for p in range(10, 100, 10)]
+            if prices else [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 8e6, 10e6, 15e6]
+        )
+
+        rows = []
+        for r in reviews_raw:
+            uid = str(r.get("userId", ""))
+            tid = str(r.get("tourId", ""))
+            if uid and tid and tid in tour_info:
+                rows.append({"user_str": uid, "tour_id_str": tid,
+                             "label": float(r.get("rating", 3))})
+
+        for b in bookings_raw:
+            uid = str(b.get("userId", ""))
+            dep_id = str(b.get("tourDepartureId", ""))
+            tid = dep_to_tour.get(dep_id, "")
+            label = BOOKING_LABELS.get(b.get("bookingStatus", ""), 3.0)
+            if uid and tid and tid in tour_info:
+                rows.append({"user_str": uid, "tour_id_str": tid, "label": label})
+
+        for i in interactions_raw:
+            uid = str(i.get("userId", ""))
+            tid = str(i.get("tourId", ""))
+            label = INTERACT_LABELS.get(i.get("type", "view"), 1.0)
+            if uid and tid and tid in tour_info:
+                rows.append({"user_str": uid, "tour_id_str": tid, "label": label})
+
+        if not rows:
+            return pd.DataFrame()
+
+        agg = (
+            pd.DataFrame(rows)
+            .groupby(["user_str", "tour_id_str"])["label"]
+            .max()
+            .reset_index()
+        )
+
+        # Encode IDs
+        unique_users = agg["user_str"].unique()
+        unique_tours = agg["tour_id_str"].unique()
+        self.user_encoder = {u: i for i, u in enumerate(unique_users)}
+        self.tour_encoder = {t: i for i, t in enumerate(unique_tours)}
+        self.tour_decoder = {v: k for k, v in self.tour_encoder.items()}
+        all_dests = set(t.get("destination", "unknown") or "unknown" for t in tours_raw)
+        self.dest_encoder = {d: i for i, d in enumerate(all_dests)}
+
+        agg["user"] = agg["user_str"].map(self.user_encoder)
+        agg["item"] = agg["tour_id_str"].map(self.tour_encoder)
+
+        # Tour features
+        feat_rows = []
+        for t in tours_raw:
+            tid = str(t["_id"])
+            feat_rows.append({
+                "tour_id_str": tid,
+                "destination":     t.get("destination", "unknown") or "unknown",
+                "price_bucket":    self._price_bucket(t.get("priceAdult", 0)),
+                "duration_bucket": _day_bucket(_parse_days(t.get("time", ""))),
+            })
+
+        feat_df = pd.DataFrame(feat_rows)
+        feat_df["item"] = feat_df["tour_id_str"].map(self.tour_encoder)
+        feat_df = feat_df.dropna(subset=["item"])
+        feat_df["item"] = feat_df["item"].astype(int)
+
+        data = agg.merge(
+            feat_df[["item", "destination", "price_bucket", "duration_bucket"]],
+            on="item", how="left"
+        )
+        data["destination"]     = data["destination"].fillna("unknown")
+        data["price_bucket"]    = data["price_bucket"].fillna(0).astype(int)
+        data["duration_bucket"] = data["duration_bucket"].fillna(0).astype(int)
+        data = data[["user", "item", "label",
+                     "destination", "price_bucket", "duration_bucket"]].dropna()
+
+        logger.info(
+            f"Training data: {len(data)} samples | "
+            f"{data['user'].nunique()} users | {data['item'].nunique()} tours"
+        )
+        return data
+
+    @staticmethod
+    def _parse_training_output(output: str) -> List[Dict]:
+        """Parse LibRecommender stdout into per-epoch metric dicts."""
+        history: List[Dict] = []
+        current: Dict = {}
+        for line in output.split("\n"):
+            m = re.match(r"(?i)epoch\s+(\d+)", line.strip())
+            if m:
+                if current:
+                    history.append(current.copy())
+                current = {"epoch": int(m.group(1))}
+            if not current:
+                continue
+            for key, pat in [
+                ("loss",      r"(?:train_)?loss[\s:=]+([0-9.]+)"),
+                ("roc_auc",   r"roc_auc[\w@]*[\s:=]+([0-9.]+)"),
+                ("precision", r"precision[\w@]*[\s:=]+([0-9.]+)"),
+                ("recall",    r"recall[\w@]*[\s:=]+([0-9.]+)"),
+                ("ndcg",      r"ndcg[\w@]*[\s:=]+([0-9.]+)"),
+            ]:
+                if key not in current:
+                    vm = re.search(pat, line, re.I)
+                    if vm:
+                        current[key] = float(vm.group(1))
+        if current:
+            history.append(current)
+        return history
+
+    def _price_bucket(self, price: float) -> int:
+        for i, b in enumerate(self.price_boundaries):
+            if price <= b:
                 return i
         return NUM_PRICE_BUCKETS - 1
 
-    def _get_duration_bucket(self, time_str: str) -> int:
-        """Convert duration string to bucket index (0-6)."""
-        import re
-        if 'ngày' in time_str:
-            match = re.search(r'(\d+)\s*ngày', time_str)
-            if match:
-                days = int(match.group(1))
-                return min(days - 1, NUM_DURATION_BUCKETS - 1)
-        return 0
+    # ── Train ─────────────────────────────────────────────────────────────────
 
-    def _get_season(self) -> int:
-        """Get current season (0=spring, 1=summer, 2=fall, 3=winter)."""
-        month = datetime.now().month
-        if month in [3, 4, 5]:
-            return 0  # Spring
-        elif month in [6, 7, 8]:
-            return 1  # Summer
-        elif month in [9, 10, 11]:
-            return 2  # Fall
-        else:
-            return 3  # Winter
+    async def train(self, db, epochs: int = None) -> Dict:
+        from libreco.algorithms import DeepFM as LibrecoDeepFM
+        from libreco.data import DatasetFeat, random_split as lib_split
 
-    def _create_model(self) -> None:
-        """Create DeepFM model."""
-        self.model = DeepFMModel(
-            num_users=len(self.user_encoder) + 100,  # Buffer for new users
-            num_tours=len(self.tour_encoder) + 50,   # Buffer for new tours
-            num_destinations=len(self.dest_encoder) + 10,
-            embedding_dim=self.embedding_dim,
-        )
+        n_ep = epochs or self.n_epochs
+        logger.info(f"Training LibRecommender DeepFM ({n_ep} epochs)...")
 
-        self.model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss='binary_crossentropy',
-            metrics=['accuracy', keras.metrics.AUC(name='auc')]
-        )
-
-    async def train(self, db, epochs: int = 15) -> Dict:
-        """Train model on booking/review data."""
-        logger.info("Training DeepFM model...")
-
-        # Prepare training data
-        X, y = await self._prepare_training_data(db)
-
-        if len(y) < 10:
-            logger.warning("Not enough training data, skipping training")
+        data = await self._fetch_and_build_df(db)
+        if len(data) < 10:
+            logger.warning("Insufficient training data")
             return {"status": "skipped", "reason": "insufficient_data"}
 
-        # Train model
-        history = self.model.fit(
-            X, y,
-            epochs=epochs,
-            batch_size=self.batch_size,
-            validation_split=0.2,
-            verbose=0,
-            callbacks=[
-                keras.callbacks.EarlyStopping(
-                    patience=3,
-                    restore_best_weights=True
-                )
-            ]
+        data = data.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        # Split
+        if len(data) >= 30:
+            train_df, eval_df = lib_split(data, multi_ratios=[0.9, 0.1], seed=42)
+        else:
+            train_df, eval_df = data, None
+
+        tf.compat.v1.reset_default_graph()
+
+        train_df, data_info = DatasetFeat.build_trainset(
+            train_df,
+            user_col=[],
+            item_col=["destination", "price_bucket", "duration_bucket"],
+            sparse_col=["destination", "price_bucket", "duration_bucket"],
+            dense_col=[],
         )
+        self.data_info = data_info
+
+        if eval_df is not None:
+            eval_df = DatasetFeat.build_evalset(eval_df)
+
+        self.model = LibrecoDeepFM(
+            task="ranking",
+            data_info=data_info,
+            embed_size=self.embed_size,
+            n_epochs=n_ep,
+            loss_type="cross_entropy",
+            lr=self.lr,
+            lr_decay=False,
+            reg=None,
+            batch_size=self.batch_size,
+            use_bn=True,
+            dropout_rate=0.2,
+            hidden_units=(128, 64, 32),
+            multi_sparse_combiner="sqrtn",
+            sampler="random",
+            num_neg=1,
+            seed=42,
+        )
+
+        fit_kw = {"neg_sampling": True, "verbose": 1, "shuffle": True}
+        if eval_df is not None:
+            fit_kw["eval_data"] = eval_df
+            fit_kw["metrics"] = ["loss", "roc_auc", "precision", "recall", "ndcg"]
+
+        buf = io.StringIO()
+        _old = sys.stdout
+        sys.stdout = buf
+        try:
+            self.model.fit(train_df, **fit_kw)
+        finally:
+            sys.stdout = _old
+
+        raw_output = buf.getvalue()
+        print(raw_output, end="")
+        self.training_history = self._parse_training_output(raw_output)
 
         self.is_trained = True
         self.last_update = datetime.now()
-
-        # Save model
         self._save_model()
 
-        metrics = {
+        result = {
             "status": "success",
-            "epochs": len(history.history['loss']),
-            "final_loss": float(history.history['loss'][-1]),
-            "final_auc": float(history.history.get('auc', [0])[-1]),
-            "samples": len(y)
+            "samples": int(len(data)),
+            "n_users": int(data["user"].nunique()),
+            "n_tours": int(data["item"].nunique()),
+            "epochs": n_ep,
+            "last_update": str(self.last_update),
         }
+        logger.info(f"Training done: {result}")
+        return result
 
-        logger.info(f"Training completed: {metrics}")
-        return metrics
-
-    async def _prepare_training_data(self, db) -> Tuple[Dict, np.ndarray]:
-        """Prepare training data from bookings and reviews."""
-        # Get bookings (positive samples)
-        bookings = await db.tbl_booking.find(
-            {'bookingStatus': {'$ne': 'x'}}
-        ).to_list(10000)
-
-        # Get reviews
-        reviews = await db.tbl_reviews.find({}).to_list(10000)
-
-        # Get tour info
-        tours = await db.tbl_tours.find({}).to_list(1000)
-        tour_info = {str(t['_id']): t for t in tours}
-
-        # Get departures for tour_id mapping
-        departures = await db.tbl_tour_departures.find({}).to_list(5000)
-        dep_to_tour = {str(d['_id']): str(d.get('tourId', '')) for d in departures}
-
-        samples = []
-        current_season = self._get_season()
-
-        # Process bookings (label = 1 for confirmed, 0.7 for pending)
-        for booking in bookings:
-            user_id = str(booking.get('userId', ''))
-            dep_id = str(booking.get('tourDepartureId', ''))
-            tour_id = dep_to_tour.get(dep_id, str(booking.get('tourId', '')))
-
-            if user_id not in self.user_encoder or tour_id not in self.tour_encoder:
-                continue
-
-            tour = tour_info.get(tour_id, {})
-            label = 1.0 if booking.get('bookingStatus') == 'c' else 0.7
-
-            samples.append(self._create_sample(user_id, tour_id, tour, label, current_season))
-
-        # Process reviews (label based on rating)
-        for review in reviews:
-            user_id = str(review.get('userId', ''))
-            tour_id = str(review.get('tourId', ''))
-
-            if user_id not in self.user_encoder or tour_id not in self.tour_encoder:
-                continue
-
-            tour = tour_info.get(tour_id, {})
-            rating = review.get('rating', 3)
-            label = rating / 5.0  # Normalize to 0-1
-
-            samples.append(self._create_sample(user_id, tour_id, tour, label, current_season))
-
-        # Add negative samples (tours user didn't interact with)
-        all_tour_ids = list(self.tour_encoder.keys())
-        user_positive_tours = {}
-
-        for s in samples:
-            uid = s['user_id']
-            tid = s['tour_id']
-            if uid not in user_positive_tours:
-                user_positive_tours[uid] = set()
-            user_positive_tours[uid].add(tid)
-
-        for user_id, user_idx in list(self.user_encoder.items())[:100]:
-            positive_tours = user_positive_tours.get(user_idx, set())
-            neg_tours = [t for t in all_tour_ids if self.tour_encoder[t] not in positive_tours]
-
-            if not neg_tours:
-                continue
-
-            neg_sample_size = min(5, len(neg_tours))
-            sampled_neg = np.random.choice(neg_tours, neg_sample_size, replace=False)
-
-            for tour_id in sampled_neg:
-                tour = tour_info.get(tour_id, {})
-                samples.append(self._create_sample(user_id, tour_id, tour, 0.0, current_season))
-
-        # Shuffle and convert to arrays
-        np.random.shuffle(samples)
-
-        X = {
-            'user_id': np.array([s['user_id'] for s in samples]),
-            'tour_id': np.array([s['tour_id'] for s in samples]),
-            'destination_id': np.array([s['destination_id'] for s in samples]),
-            'price_bucket': np.array([s['price_bucket'] for s in samples]),
-            'duration_bucket': np.array([s['duration_bucket'] for s in samples]),
-            'has_images': np.array([s['has_images'] for s in samples]),
-            'has_itinerary': np.array([s['has_itinerary'] for s in samples]),
-            'season': np.array([s['season'] for s in samples]),
-        }
-        y = np.array([s['label'] for s in samples])
-
-        logger.info(f"Prepared {len(samples)} training samples")
-        return X, y
-
-    def _create_sample(self, user_id: str, tour_id: str, tour: Dict,
-                       label: float, season: int) -> Dict:
-        """Create a single training sample with all 8 fields."""
-        return {
-            'user_id': self.user_encoder.get(user_id, 0),
-            'tour_id': self.tour_encoder.get(tour_id, 0),
-            'destination_id': self.dest_encoder.get(tour.get('destination', ''), 0),
-            'price_bucket': self._get_price_bucket(tour.get('priceAdult', 0)),
-            'duration_bucket': self._get_duration_bucket(tour.get('time', '')),
-            'has_images': 1 if tour.get('images') else 0,
-            'has_itinerary': 1 if tour.get('itinerary') else 0,
-            'season': season,
-            'label': label
-        }
+    # ── Predict ───────────────────────────────────────────────────────────────
 
     async def predict(
         self,
         user_id: str,
         tour_ids: List[str],
-        db
+        db,
     ) -> List[Tuple[str, float]]:
-        """
-        Predict scores for user-tour pairs.
-
-        For new users (not in encoder), they will use index 0 embedding.
-        This means recommendations will be based primarily on tour features
-        rather than user-specific preferences.
-        """
+        """Trả về list (tour_id_str, score) cho các tour được yêu cầu."""
         if not self.is_trained or self.model is None:
             return [(tid, 0.5) for tid in tour_ids]
 
-        # Dynamically add new user to encoder if needed
-        # This ensures the user gets a unique embedding for future interactions
-        if user_id not in self.user_encoder:
-            new_idx = len(self.user_encoder) + 1
-            # Check if within model capacity
-            if new_idx < self.model.num_users:
-                self.user_encoder[user_id] = new_idx
-                logger.info(f"Added new user to encoder: {user_id} -> {new_idx}")
+        encoded_user = self.user_encoder.get(user_id)
 
-        # Get tour info
-        from bson import ObjectId
-        tours = await db.tbl_tours.find({
-            '_id': {'$in': [ObjectId(tid) for tid in tour_ids]}
-        }).to_list(100)
-        tour_info = {str(t['_id']): t for t in tours}
+        # Cold-start user: dùng recommend_user với cold_start="average"
+        if encoded_user is None:
+            return self._cold_start_scores(tour_ids)
 
-        # Prepare batch input
-        samples = []
-        valid_tour_ids = []
-        current_season = self._get_season()
+        valid = [(tid, self.tour_encoder[tid])
+                 for tid in tour_ids if tid in self.tour_encoder]
 
-        for tour_id in tour_ids:
-            tour = tour_info.get(tour_id, {})
-            if not tour:
-                continue
+        if not valid:
+            return [(tid, 0.5) for tid in tour_ids]
 
-            sample = self._create_sample(user_id, tour_id, tour, 0.0, current_season)
-            del sample['label']
-            samples.append(sample)
-            valid_tour_ids.append(tour_id)
+        str_ids  = [v[0] for v in valid]
+        item_ids = [v[1] for v in valid]
 
-        if not samples:
+        try:
+            scores = self.model.predict(
+                user=[encoded_user] * len(item_ids),
+                item=item_ids,
+            )
+            score_list = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+            return list(zip(str_ids, score_list))
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            return [(tid, 0.5) for tid in tour_ids]
+
+    def _cold_start_scores(self, tour_ids: List[str]) -> List[Tuple[str, float]]:
+        """Score cho cold-start user: dùng popularity proxy (trả về 0.5 uniform)."""
+        return [(tid, 0.5) for tid in tour_ids]
+
+    async def recommend(self, user_id: str, n_rec: int = 10) -> List[str]:
+        """
+        Đề xuất top-N tour (trả về list MongoDB tour ID string).
+        Dùng LibRecommender recommend_user() — tự loại tour đã tương tác.
+        """
+        if not self.is_trained or self.model is None:
             return []
 
-        X = {
-            'user_id': np.array([s['user_id'] for s in samples]),
-            'tour_id': np.array([s['tour_id'] for s in samples]),
-            'destination_id': np.array([s['destination_id'] for s in samples]),
-            'price_bucket': np.array([s['price_bucket'] for s in samples]),
-            'duration_bucket': np.array([s['duration_bucket'] for s in samples]),
-            'has_images': np.array([s['has_images'] for s in samples]),
-            'has_itinerary': np.array([s['has_itinerary'] for s in samples]),
-            'season': np.array([s['season'] for s in samples]),
-        }
+        encoded_user = self.user_encoder.get(user_id)
+        if encoded_user is None:
+            return []
 
-        # Predict
-        scores = self.model.predict(X, verbose=0).flatten()
+        try:
+            recs = self.model.recommend_user(user=encoded_user, n_rec=n_rec)
+            encoded_items = recs.get(encoded_user, [])
+            return [self.tour_decoder[eid]
+                    for eid in encoded_items if eid in self.tour_decoder]
+        except Exception as e:
+            logger.error(f"Recommend error: {e}")
+            return []
 
-        return list(zip(valid_tour_ids, scores.tolist()))
+    # ── Online update ─────────────────────────────────────────────────────────
 
     async def online_update(self, db, interaction: Dict) -> None:
         """
-        Update model with new interaction (online learning).
-
-        interaction: {
-            'user_id': str,
-            'tour_id': str,
-            'label': float (0-1),
-            'type': 'booking' | 'review' | 'click'
-        }
+        Tích lũy interaction mới, retrain khi đạt ngưỡng.
+        LibRecommender không hỗ trợ incremental update nên dùng batch retrain.
         """
-        if not self.is_trained or self.model is None:
-            return
+        self._pending.append(interaction)
+        logger.debug(f"Pending interactions: {len(self._pending)}/{self._retrain_threshold}")
 
-        user_id = interaction['user_id']
-        tour_id = interaction['tour_id']
-        label = interaction['label']
+        if len(self._pending) >= self._retrain_threshold:
+            logger.info("Threshold reached — retraining DeepFM...")
+            await self.train(db)
+            self._pending.clear()
 
-        # Add new user/tour to encoder if needed
-        if user_id not in self.user_encoder:
-            self.user_encoder[user_id] = len(self.user_encoder) + 1
-        if tour_id not in self.tour_encoder:
-            self.tour_encoder[tour_id] = len(self.tour_encoder) + 1
-
-        # Get tour info
-        from bson import ObjectId
-        tour = await db.tbl_tours.find_one({'_id': ObjectId(tour_id)})
-
-        if not tour:
-            return
-
-        # Prepare single sample
-        sample = self._create_sample(user_id, tour_id, tour, label, self._get_season())
-
-        X = {
-            'user_id': np.array([sample['user_id']]),
-            'tour_id': np.array([sample['tour_id']]),
-            'destination_id': np.array([sample['destination_id']]),
-            'price_bucket': np.array([sample['price_bucket']]),
-            'duration_bucket': np.array([sample['duration_bucket']]),
-            'has_images': np.array([sample['has_images']]),
-            'has_itinerary': np.array([sample['has_itinerary']]),
-            'season': np.array([sample['season']]),
-        }
-        y = np.array([label])
-
-        # Single step update
-        self.model.fit(X, y, epochs=1, verbose=0)
-
-        logger.debug(f"Online update: user={user_id}, tour={tour_id}, label={label}")
+    # ── Save / Load ───────────────────────────────────────────────────────────
 
     def _save_model(self) -> None:
-        """Save model and encoders."""
         os.makedirs(self.model_path, exist_ok=True)
 
-        # Save model weights
-        self.model.save_weights(f"{self.model_path}/weights.h5")
+        self.data_info.save(self.model_path, model_name="deepfm")
+        self.model.save(self.model_path, model_name="deepfm")
 
-        # Save encoders and config
-        config = {
-            'user_encoder': self.user_encoder,
-            'tour_encoder': self.tour_encoder,
-            'dest_encoder': self.dest_encoder,
-            'price_boundaries': self.price_boundaries,
-            'is_trained': self.is_trained,
-            'last_update': self.last_update,
-            'model_config': {
-                'num_users': self.model.num_users,
-                'num_tours': self.model.num_tours,
-                'num_destinations': self.model.num_destinations,
-                'embedding_dim': self.model.embedding_dim,
-            }
+        meta = {
+            "user_encoder":    self.user_encoder,
+            "tour_encoder":    self.tour_encoder,
+            "tour_decoder":    self.tour_decoder,
+            "dest_encoder":    self.dest_encoder,
+            "price_boundaries": self.price_boundaries,
+            "is_trained":      self.is_trained,
+            "last_update":     self.last_update,
+            "n_epochs":        self.n_epochs,
+            "embed_size":      self.embed_size,
+            "training_history": self.training_history,
         }
+        with open(f"{self.model_path}/meta.pkl", "wb") as f:
+            pickle.dump(meta, f)
 
-        with open(f"{self.model_path}/config.pkl", 'wb') as f:
-            pickle.dump(config, f)
-
-        logger.info(f"Model saved to {self.model_path}")
+        logger.info(f"Model saved → {self.model_path}")
 
     def _load_model(self) -> bool:
-        """Load model and encoders."""
-        config_path = f"{self.model_path}/config.pkl"
-        weights_path = f"{self.model_path}/weights.h5"
-
-        if not os.path.exists(config_path) or not os.path.exists(weights_path):
+        meta_path = f"{self.model_path}/meta.pkl"
+        if not os.path.exists(meta_path):
             return False
 
         try:
-            with open(config_path, 'rb') as f:
-                config = pickle.load(f)
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
 
-            self.user_encoder = config['user_encoder']
-            self.tour_encoder = config['tour_encoder']
-            self.dest_encoder = config['dest_encoder']
-            self.price_boundaries = config.get('price_boundaries', [])
-            self.is_trained = config['is_trained']
-            self.last_update = config['last_update']
+            self.user_encoder    = meta["user_encoder"]
+            self.tour_encoder    = meta["tour_encoder"]
+            self.tour_decoder    = meta["tour_decoder"]
+            self.dest_encoder    = meta.get("dest_encoder", {})
+            self.price_boundaries  = meta["price_boundaries"]
+            self.last_update       = meta["last_update"]
+            self.training_history  = meta.get("training_history", [])
 
-            # Recreate model with same config
-            model_config = config['model_config']
-            self.model = DeepFMModel(
-                num_users=model_config['num_users'],
-                num_tours=model_config['num_tours'],
-                num_destinations=model_config['num_destinations'],
-                embedding_dim=model_config['embedding_dim'],
+            from libreco.algorithms import DeepFM as LibrecoDeepFM
+            from libreco.data import DataInfo
+
+            tf.compat.v1.reset_default_graph()
+            self.data_info = DataInfo.load(self.model_path, model_name="deepfm")
+            self.model = LibrecoDeepFM.load(
+                path=self.model_path,
+                model_name="deepfm",
+                data_info=self.data_info,
             )
-
-            self.model.compile(
-                optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
-                loss='binary_crossentropy',
-                metrics=['accuracy', keras.metrics.AUC(name='auc')]
-            )
-
-            # Build model by calling with dummy input
-            dummy_input = {
-                'user_id': np.array([0]),
-                'tour_id': np.array([0]),
-                'destination_id': np.array([0]),
-                'price_bucket': np.array([0]),
-                'duration_bucket': np.array([0]),
-                'has_images': np.array([0]),
-                'has_itinerary': np.array([0]),
-                'season': np.array([0]),
-            }
-            self.model(dummy_input)
-
-            # Load weights
-            self.model.load_weights(weights_path)
-
-            logger.info(f"Model loaded from {self.model_path}")
+            logger.info("Model loaded from disk")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Load failed: {e}")
             return False
