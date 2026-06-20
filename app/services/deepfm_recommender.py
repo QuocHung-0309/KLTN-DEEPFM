@@ -501,7 +501,7 @@ class DeepFMRecommenderService:
 
     async def retrain(self, epochs: int = 10) -> Dict:
         """Retrain the model with all available data."""
-        if not self.db:
+        if self.db is None:
             return {"status": "error", "message": "Database not connected"}
 
         return await self.deepfm.train(self.db, epochs=epochs)
