@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: tlcn-recommendation
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: PORT
+        value: 8000
+      - key: DEBUG
+        value: "false"
